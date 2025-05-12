@@ -1,0 +1,785 @@
+# app
+
+
+<li class="nav-item">
+    <a class="nav-link" href="{{ url_for('compare_view') }}">
+        <i class="fas fa-code-compare me-1"></i> Compare Code
+    </a>
+</li>
+
+@app.route('/compare')
+def compare_view():
+    """Page for comparing variables across repositories"""
+    if not session.get('logged_in'):
+        flash('Please log in first', 'warning')
+        return redirect(url_for('login'))
+    
+    # Get list of indexes for selection
+    indexes = get_all_indexes(config.INDEXES_DIR)
+    
+    return render_template('compare.html', indexes=indexes)
+
+@app.route('/api/compare', methods=['POST'])
+def compare_variables():
+    """API endpoint for comparing variables between two indexes"""
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    # Get comparison parameters
+    data = request.json
+    index1_dir = data.get('index1_dir')
+    index2_dir = data.get('index2_dir')
+    variable1 = data.get('variable1')
+    variable2 = data.get('variable2')
+    
+    if not all([index1_dir, index2_dir, variable1, variable2]):
+        return jsonify({'error': 'Missing required parameters'}), 400
+    
+    try:
+        # Load both indexes
+        index1_path = os.path.join(config.INDEXES_DIR, index1_dir)
+        index2_path = os.path.join(config.INDEXES_DIR, index2_dir)
+        
+        if not (os.path.exists(index1_path) and os.path.exists(index2_path)):
+            return jsonify({'error': 'One or both indexes not found'}), 404
+        
+        # Load indexes
+        index1, tokenized_corpus1, corpus1, metadata1 = load_index(index1_path)
+        index2, tokenized_corpus2, corpus2, metadata2 = load_index(index2_path)
+        
+        # Search for variables in respective indexes
+        results1 = search_variable_context(variable1, index1, tokenized_corpus1, corpus1)
+        results2 = search_variable_context(variable2, index2, tokenized_corpus2, corpus2)
+        
+        # Prepare context for the LLM
+        context1 = "\n\n".join([
+            f"File: {res['document']['path']} (Chunk {res['document']['chunk_id']})\n"
+            f"{res['document']['content']}" 
+            for res in results1
+        ])
+        
+        context2 = "\n\n".join([
+            f"File: {res['document']['path']} (Chunk {res['document']['chunk_id']})\n"
+            f"{res['document']['content']}" 
+            for res in results2
+        ])
+        
+        # Query the LLM to compare the implementations
+        comparison = compare_implementations(
+            variable1, variable2,
+            context1, context2,
+            metadata1, metadata2,
+            results1, results2,
+            config.VLLM_ENDPOINT,
+            config.VLLM_MODEL
+        )
+        
+        # Format the results
+        results = {
+            "comparison": comparison["generated_text"],
+            "sources1": format_sources(results1, metadata1['language']),
+            "sources2": format_sources(results2, metadata2['language']),
+            "variable1": variable1,
+            "variable2": variable2,
+            "language1": metadata1['language'],
+            "language2": metadata2['language'],
+            "repo1": metadata1['name'],
+            "repo2": metadata2['name']
+        }
+        
+        return jsonify(results)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+#css
+
+
+/* Comparison specific styles */
+.comparison-content {
+    font-size: 0.95rem;
+    line-height: 1.6;
+}
+
+.comparison-content h3 {
+    margin-top: 1.5rem;
+    margin-bottom: 0.75rem;
+    color: var(--bs-primary);
+    font-size: 1.4rem;
+}
+
+.comparison-content h4 {
+    margin-top: 1.25rem;
+    margin-bottom: 0.5rem;
+    font-size: 1.2rem;
+}
+
+.comparison-content h5 {
+    margin-top: 1rem;
+    margin-bottom: 0.5rem;
+    font-size: 1.1rem;
+}
+
+.comparison-content code {
+    background-color: rgba(0, 0, 0, 0.05);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9em;
+}
+
+.comparison-content pre {
+    background-color: #282c34;
+    border-radius: 5px;
+    margin: 1rem 0;
+}
+
+.comparison-content pre code {
+    background-color: transparent;
+    padding: 0;
+    font-size: 0.9rem;
+    color: #abb2bf;
+}
+
+.side-by-side-container {
+    display: flex;
+    gap: 15px;
+    margin-bottom: 1rem;
+}
+
+.side-by-side-container > div {
+    flex: 1;
+    border: 1px solid #e0e0e0;
+    border-radius: 5px;
+    padding: 10px;
+}
+
+.side-by-side-container .side-title {
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+    font-size: 0.9rem;
+    color: var(--bs-primary);
+    border-bottom: 1px solid #eee;
+    padding-bottom: 5px;
+}
+
+
+
+#retrival
+def search_variable_context(variable_name: str, index: BM25Okapi, tokenized_corpus: List[List[str]], 
+                          corpus: List[Dict[str, Any]], top_k: int = 8) -> List[Dict[str, Any]]:
+    """
+    Search for a variable and its context in an index
+    
+    Args:
+        variable_name: The variable to search for
+        index: BM25 index
+        tokenized_corpus: Tokenized corpus
+        corpus: Original corpus
+        top_k: Number of results to return
+        
+    Returns:
+        List of search results with variable context
+    """
+    # This is a specialized version of the _variable_centric_search function
+    # Tokenize the variable name
+    tokenized_var = variable_name.split()
+    var_scores = index.get_scores(tokenized_var)
+    
+    # Get the top_k*2 document indices (we'll filter later)
+    initial_top_k = min(top_k * 2, len(var_scores))
+    top_indices = sorted(range(len(var_scores)), key=lambda i: var_scores[i], reverse=True)[:initial_top_k]
+    
+    # First pass: get documents that directly mention the variable
+    direct_hits = []
+    for i in top_indices:
+        doc = corpus[i]
+        score = var_scores[i]
+        
+        # Increase score if the document contains an exact match for the variable
+        doc_content = doc["content"].lower()
+        if variable_name.lower() in doc_content:
+            # Check for variable definition patterns
+            if f"def {variable_name}" in doc_content or f"class {variable_name}" in doc_content:
+                score *= 1.5
+            elif f"{variable_name} =" in doc_content or f"const {variable_name}" in doc_content:
+                score *= 1.3
+            elif f"var {variable_name}" in doc_content or f"let {variable_name}" in doc_content:
+                score *= 1.3
+            
+            direct_hits.append((i, doc, score))
+    
+    # Sort by score
+    direct_hits.sort(key=lambda x: x[2], reverse=True)
+    
+    # Take the top hits
+    results = []
+    seen_files = set()
+    
+    # Add the top direct hits
+    for i, doc, score in direct_hits[:top_k]:
+        file_path = doc["path"]
+        
+        # Try to include different files for diversity
+        if file_path not in seen_files or len(results) < top_k // 2:
+            seen_files.add(file_path)
+            results.append({
+                'document': doc,
+                'score': score
+            })
+    
+    # Look for function/class definitions and usage contexts
+    relevant_files = {doc["document"]["path"] for doc in results}
+    
+    # Find additional relevant contexts
+    for i, tokenized_doc in enumerate(tokenized_corpus):
+        doc = corpus[i]
+        file_path = doc["path"]
+        
+        # If this document is from a file we already found interesting
+        if file_path in relevant_files and len(results) < top_k:
+            # Skip if we already have this exact chunk
+            if any(r['document']['path'] == file_path and 
+                   r['document']['chunk_id'] == doc['chunk_id'] for r in results):
+                continue
+                
+            doc_content = " ".join(tokenized_doc).lower()
+            
+            # Check if this chunk contains function definitions, class definitions, or imports
+            if ("def " in doc_content or "class " in doc_content or 
+                "import " in doc_content or "from " in doc_content):
+                results.append({
+                    'document': doc,
+                    'score': var_scores[i] * 0.8  # Slightly lower score for context
+                })
+    
+    # Sort final results by score
+    results.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Limit to top_k
+    return results[:top_k]
+
+def compare_implementations(variable1: str, variable2: str, 
+                           context1: str, context2: str,
+                           metadata1: Dict[str, Any], metadata2: Dict[str, Any],
+                           results1: List[Dict[str, Any]], results2: List[Dict[str, Any]],
+                           endpoint: str, model: str) -> Dict[str, Any]:
+    """
+    Query the LLM to compare two variable implementations
+    
+    Args:
+        variable1: First variable name
+        variable2: Second variable name
+        context1: Code context for first variable
+        context2: Code context for second variable
+        metadata1: Metadata for first index
+        metadata2: Metadata for second index
+        results1: Search results for first variable
+        results2: Search results for second variable
+        endpoint: VLLM endpoint
+        model: Model name
+        
+    Returns:
+        Response from the LLM
+    """
+    # Create a structured context summary
+    context1_files = {result['document']['path'] for result in results1}
+    context2_files = {result['document']['path'] for result in results2}
+    
+    context1_summary = f"Context for '{variable1}' includes {len(results1)} code snippets from {len(context1_files)} files in {metadata1['name']} ({metadata1['language']})"
+    context2_summary = f"Context for '{variable2}' includes {len(results2)} code snippets from {len(context2_files)} files in {metadata2['name']} ({metadata2['language']})"
+    
+    # Build the prompt for the LLM
+    full_prompt = f"""
+You are an expert code comparison assistant. Compare the implementations and usage of two variables that represent the same concept in different codebases.
+
+FIRST VARIABLE: '{variable1}' in {metadata1['language']} codebase ({metadata1['name']})
+{context1_summary}
+
+CODE CONTEXT FOR '{variable1}':
+{context1}
+
+SECOND VARIABLE: '{variable2}' in {metadata2['language']} codebase ({metadata2['name']})
+{context2_summary}
+
+CODE CONTEXT FOR '{variable2}':
+{context2}
+
+Please provide a detailed comparison between these two implementations. Include:
+1. The purpose and functionality of these variables
+2. Similarities and differences in implementation
+3. How they're used within their respective codebases
+4. Language-specific features or patterns leveraged in each implementation
+5. Any observations about efficiency, readability, or maintainability differences
+
+Format your response with clear headings and, where applicable, code snippets to illustrate key points. Be specific about file locations when referencing code.
+"""
+    
+    # Query the LLM
+    payload = {
+        "prompt": full_prompt,
+        "max_tokens": 1024,  # Increased token limit for detailed comparison
+        "temperature": 0.2,
+        "model": model
+    }
+    
+    try:
+        response = requests.post(endpoint, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        return result
+    except Exception as e:
+        return {
+            "error": str(e),
+            "generated_text": f"Error querying LLM: {str(e)}"
+        }
+
+def format_sources(results: List[Dict[str, Any]], language: str) -> List[Dict[str, Any]]:
+    """
+    Format search results as sources for display
+    
+    Args:
+        results: List of search results
+        language: Programming language
+        
+    Returns:
+        Formatted sources
+    """
+    sources = []
+    for i, result in enumerate(results):
+        doc = result["document"]
+        
+        # Create a clean copy without the full document
+        source = {
+            "id": i + 1,
+            "path": doc["path"],
+            "chunk_id": doc["chunk_id"],
+            "score": result["score"],
+            "content": doc["file_content"],
+            "chunk": doc["content"],
+            "language": language
+        }
+        sources.append(source)
+    
+    # Sort sources by relevance score
+    sources.sort(key=lambda x: x["score"], reverse=True)
+    
+    return sources
+
+
+#comparehtml
+
+<!-- templates/compare.html -->
+{% extends "layout.html" %}
+
+{% block title %}Compare Code - Zenassist{% endblock %}
+
+{% block head %}
+<!-- Google Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<!-- Highlight.js for code highlighting -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/atom-one-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+<!-- Load common programming languages -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/languages/python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/languages/javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/languages/cpp.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/languages/csharp.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/languages/go.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="row align-items-center mb-4">
+    <div class="col">
+        <h1 class="display-5">
+            <i class="fas fa-code-compare me-2 text-primary"></i>Code Comparison
+        </h1>
+        <p class="lead">Compare variable implementations across different codebases</p>
+    </div>
+    <div class="col-auto">
+        <a href="{{ url_for('dashboard') }}" class="btn btn-outline-primary">
+            <i class="fas fa-arrow-left me-2"></i>Back to Home
+        </a>
+    </div>
+</div>
+
+<!-- Comparison Form -->
+<div class="card shadow mb-4">
+    <div class="card-header">
+        <h5 class="card-title mb-0">
+            <i class="fas fa-search me-2 text-primary"></i>Select Codebases & Variables to Compare
+        </h5>
+    </div>
+    <div class="card-body">
+        <form id="comparison-form">
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label for="index1" class="form-label">First Codebase</label>
+                    <select class="form-select" id="index1" required>
+                        <option value="" selected disabled>Select a repository...</option>
+                        {% for index in indexes %}
+                        <option value="{{ index.directory }}" data-language="{{ index.language }}">
+                            {{ index.name }} ({{ index.language }})
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="index2" class="form-label">Second Codebase</label>
+                    <select class="form-select" id="index2" required>
+                        <option value="" selected disabled>Select a repository...</option>
+                        {% for index in indexes %}
+                        <option value="{{ index.directory }}" data-language="{{ index.language }}">
+                            {{ index.name }} ({{ index.language }})
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label for="variable1" class="form-label">First Variable</label>
+                    <div class="input-group">
+                        <span class="input-group-text" id="lang1-badge"><i class="fas fa-code"></i></span>
+                        <input type="text" class="form-control" id="variable1" placeholder="Variable name in first codebase" required>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="variable2" class="form-label">Second Variable</label>
+                    <div class="input-group">
+                        <span class="input-group-text" id="lang2-badge"><i class="fas fa-code"></i></span>
+                        <input type="text" class="form-control" id="variable2" placeholder="Variable name in second codebase" required>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="d-grid">
+                <button type="submit" id="compare-btn" class="btn btn-primary">
+                    <i class="fas fa-code-compare me-2"></i>Compare Implementations
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Results Container -->
+<div id="results-container" class="d-none">
+    <!-- Comparison Results -->
+    <div class="card shadow mb-4">
+        <div class="card-header">
+            <h5 class="card-title mb-0" id="comparison-title">
+                <i class="fas fa-lightbulb me-2 text-primary"></i>Comparison Analysis
+            </h5>
+        </div>
+        <div class="card-body">
+            <div id="comparison-content" class="comparison-content"></div>
+        </div>
+    </div>
+    
+    <!-- Source Code Comparison -->
+    <div class="row">
+        <!-- First Variable Sources -->
+        <div class="col-md-6 mb-4">
+            <div class="card shadow h-100">
+                <div class="card-header">
+                    <h5 class="card-title mb-0" id="sources1-title">
+                        <i class="fas fa-code me-2 text-primary"></i>First Variable Sources
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div class="sources-container" id="sources1-container">
+                        <div class="accordion" id="sources1-accordion">
+                            <!-- Sources will be inserted here dynamically -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Second Variable Sources -->
+        <div class="col-md-6 mb-4">
+            <div class="card shadow h-100">
+                <div class="card-header">
+                    <h5 class="card-title mb-0" id="sources2-title">
+                        <i class="fas fa-code me-2 text-primary"></i>Second Variable Sources
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div class="sources-container" id="sources2-container">
+                        <div class="accordion" id="sources2-accordion">
+                            <!-- Sources will be inserted here dynamically -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Loading Indicator -->
+<div id="loading" class="position-fixed top-50 start-50 translate-middle d-none" style="z-index: 1050;">
+    <div class="bg-white p-4 rounded shadow-lg text-center">
+        <div class="spinner-border text-primary" role="status" style="width: 3rem; height: 3rem;">
+            <span class="visually-hidden">Loading...</span>
+        </div>
+        <p class="mt-3 mb-0">Analyzing code comparison...</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const comparisonForm = document.getElementById('comparison-form');
+        const compareBtn = document.getElementById('compare-btn');
+        const resultsContainer = document.getElementById('results-container');
+        const loadingElement = document.getElementById('loading');
+        const index1Select = document.getElementById('index1');
+        const index2Select = document.getElementById('index2');
+        const variable1Input = document.getElementById('variable1');
+        const variable2Input = document.getElementById('variable2');
+        const lang1Badge = document.getElementById('lang1-badge');
+        const lang2Badge = document.getElementById('lang2-badge');
+        
+        // Update language badges when indexes are selected
+        index1Select.addEventListener('change', function() {
+            const selectedOption = this.options[this.selectedIndex];
+            const language = selectedOption.getAttribute('data-language');
+            lang1Badge.innerHTML = `<span class="badge bg-primary">${language}</span>`;
+        });
+        
+        index2Select.addEventListener('change', function() {
+            const selectedOption = this.options[this.selectedIndex];
+            const language = selectedOption.getAttribute('data-language');
+            lang2Badge.innerHTML = `<span class="badge bg-primary">${language}</span>`;
+        });
+        
+        // Handle comparison form submission
+        comparisonForm.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const index1Dir = index1Select.value;
+            const index2Dir = index2Select.value;
+            const variable1 = variable1Input.value.trim();
+            const variable2 = variable2Input.value.trim();
+            
+            if (!index1Dir || !index2Dir || !variable1 || !variable2) {
+                alert('Please fill in all required fields');
+                return;
+            }
+            
+            // Show loading state
+            loadingElement.classList.remove('d-none');
+            compareBtn.disabled = true;
+            compareBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span> Comparing...';
+            
+            try {
+                // Call the API
+                const response = await fetch('/api/compare', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        index1_dir: index1Dir,
+                        index2_dir: index2Dir,
+                        variable1: variable1,
+                        variable2: variable2
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                // Display results
+                displayResults(data);
+                
+                // Show results container
+                resultsContainer.classList.remove('d-none');
+                
+                // Scroll to results
+                resultsContainer.scrollIntoView({ behavior: 'smooth' });
+                
+            } catch (error) {
+                console.error('Error comparing code:', error);
+                alert(`Error comparing code: ${error.message}`);
+            } finally {
+                // Reset loading state
+                loadingElement.classList.add('d-none');
+                compareBtn.disabled = false;
+                compareBtn.innerHTML = '<i class="fas fa-code-compare me-2"></i>Compare Implementations';
+            }
+        });
+        
+        // Function to display comparison results
+        function displayResults(data) {
+            // Update comparison titles
+            document.getElementById('comparison-title').innerHTML = 
+                `<i class="fas fa-lightbulb me-2 text-primary"></i>Comparison Analysis: ${data.variable1} vs ${data.variable2}`;
+            
+            document.getElementById('sources1-title').innerHTML = 
+                `<i class="fas fa-code me-2 text-primary"></i>${data.variable1} in ${data.repo1} (${data.language1})`;
+            
+            document.getElementById('sources2-title').innerHTML = 
+                `<i class="fas fa-code me-2 text-primary"></i>${data.variable2} in ${data.repo2} (${data.language2})`;
+            
+            // Display comparison text
+            const comparisonContent = document.getElementById('comparison-content');
+            comparisonContent.innerHTML = formatExplanation(data.comparison);
+            
+            // Display sources for first variable
+            const sources1Accordion = document.getElementById('sources1-accordion');
+            sources1Accordion.innerHTML = '';
+            
+            data.sources1.forEach((source, index) => {
+                const accordionItem = createSourceAccordionItem(
+                    source, 
+                    index, 
+                    'sources1', 
+                    data.language1.toLowerCase()
+                );
+                sources1Accordion.appendChild(accordionItem);
+            });
+            
+            // Display sources for second variable
+            const sources2Accordion = document.getElementById('sources2-accordion');
+            sources2Accordion.innerHTML = '';
+            
+            data.sources2.forEach((source, index) => {
+                const accordionItem = createSourceAccordionItem(
+                    source, 
+                    index, 
+                    'sources2', 
+                    data.language2.toLowerCase()
+                );
+                sources2Accordion.appendChild(accordionItem);
+            });
+            
+            // Initialize syntax highlighting
+            document.querySelectorAll('pre code').forEach((block) => {
+                hljs.highlightElement(block);
+            });
+        }
+        
+        // Function to create source accordion item
+        function createSourceAccordionItem(source, index, prefix, language) {
+            const accordionItem = document.createElement('div');
+            accordionItem.className = 'accordion-item';
+            
+            const header = document.createElement('h2');
+            header.className = 'accordion-header';
+            
+            const button = document.createElement('button');
+            button.className = 'accordion-button collapsed';
+            button.type = 'button';
+            button.setAttribute('data-bs-toggle', 'collapse');
+            button.setAttribute('data-bs-target', `#${prefix}-source-${index}`);
+            button.innerHTML = `
+                <div class="d-flex w-100 justify-content-between align-items-center">
+                    <div>
+                        <i class="fas fa-file-code me-2 text-primary"></i>
+                        <strong>${source.path}</strong>
+                    </div>
+                </div>
+            `;
+            
+            const collapseDiv = document.createElement('div');
+            collapseDiv.id = `${prefix}-source-${index}`;
+            collapseDiv.className = 'accordion-collapse collapse';
+            
+            const accordionBody = document.createElement('div');
+            accordionBody.className = 'accordion-body p-0';
+            
+            const pre = document.createElement('pre');
+            pre.className = 'm-0';
+            
+            const code = document.createElement('code');
+            code.className = `language-${getLanguageFromPath(source.path, language)}`;
+            code.textContent = source.content;
+            
+            pre.appendChild(code);
+            accordionBody.appendChild(pre);
+            collapseDiv.appendChild(accordionBody);
+            header.appendChild(button);
+            accordionItem.appendChild(header);
+            accordionItem.appendChild(collapseDiv);
+            
+            return accordionItem;
+        }
+        
+        // Function to format explanation text with markdown-like formatting
+        function formatExplanation(text) {
+            // Simple markdown-like formatting
+            let formatted = text
+                // Code blocks
+                .replace(/```([a-z]*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>')
+                // Inline code
+                .replace(/`([^`]+)`/g, '<code>$1</code>')
+                // Bold
+                .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+                // Italic
+                .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+                // Headers
+                .replace(/^### (.*$)/gm, '<h5>$1</h5>')
+                .replace(/^## (.*$)/gm, '<h4>$1</h4>')
+                .replace(/^# (.*$)/gm, '<h3>$1</h3>')
+                // Lists
+                .replace(/^\s*- (.*$)/gm, '<li>$1</li>')
+                .replace(/^\s*\d+\. (.*$)/gm, '<li>$1</li>')
+                // Wrap lists
+                .replace(/<li>(.*)<\/li>\n<li>/g, '<li>$1</li>\n<li>')
+                .replace(/(<li>.*<\/li>\n)+/g, '<ul>$&</ul>')
+                // Paragraphs
+                .replace(/\n\n/g, '</p><p>');
+            
+            // Wrap in paragraph tags if not already
+            if (!formatted.startsWith('<')) {
+                formatted = '<p>' + formatted + '</p>';
+            }
+            
+            return formatted;
+        }
+        
+        // Function to determine language from file path
+        function getLanguageFromPath(path, defaultLanguage) {
+            const extension = path.split('.').pop().toLowerCase();
+            
+            const extensionToLanguage = {
+                'py': 'python',
+                'js': 'javascript',
+                'jsx': 'javascript',
+                'ts': 'typescript',
+                'tsx': 'typescript',
+                'java': 'java',
+                'c': 'c',
+                'cpp': 'cpp',
+                'h': 'cpp',
+                'hpp': 'cpp',
+                'cc': 'cpp',
+                'cs': 'csharp',
+                'go': 'go',
+                'rb': 'ruby',
+                'php': 'php',
+                'rs': 'rust',
+                'swift': 'swift',
+                'kt': 'kotlin',
+                'kts': 'kotlin',
+                'scala': 'scala'
+            };
+            
+            return extensionToLanguage[extension] || defaultLanguage || 'plaintext';
+        }
+    });
+</script>
+{% endblock %}
